@@ -18,6 +18,9 @@ import hydra
 import pydantic
 from omegaconf import DictConfig
 from adam_atan2 import AdamATan2
+from torch.optim import Optimizer
+if not hasattr(Optimizer, "_cuda_graph_capture_health_check"):
+    Optimizer._cuda_graph_capture_health_check = Optimizer._accelerator_graph_capture_health_check
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
