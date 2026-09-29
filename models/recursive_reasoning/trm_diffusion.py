@@ -1,4 +1,4 @@
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple, List, Dict, Optional, Literal
 from dataclasses import dataclass
 import math
 import torch
@@ -10,26 +10,30 @@ import random
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
+from models.losses import log_stablemax
 
 IGNORE_LABEL_ID = -100
 
 @dataclass
-class TinyRecursiveReasoningModel_ACTV1InnerCarry:
+class TRMDiffusion_ACTV1InnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
 
 
 @dataclass
-class TinyRecursiveReasoningModel_ACTV1Carry:
-    inner_carry: TinyRecursiveReasoningModel_ACTV1InnerCarry
+class TRMDiffusion_ACTV1Carry:
+    inner_carry: TRMDiffusion_ACTV1InnerCarry
     
     steps: torch.Tensor
     halted: torch.Tensor
     
+    canvas: torch.Tensor
+    canvas_probs: torch.Tensor
+    
     current_data: Dict[str, torch.Tensor]
 
 
-class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
+class TRMDiffusion_ACTV1Config(BaseModel):
     batch_size: int
     seq_len: int
     puzzle_emb_ndim: int = 0
@@ -61,9 +65,14 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mlp_t: bool = False # use mlp on L instead of transformer
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    
+    # Diffusion config
+    diffusion: Literal["uniform", "masked"]
+    confidence_threshold: float
 
-class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
-    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+class TRMDiffusion_ACTV1Block(nn.Module):
+    
+    def __init__(self, config: TRMDiffusion_ACTV1Config) -> None:
         super().__init__()
 
         self.config = config
@@ -103,8 +112,9 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         return hidden_states
 
-class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
-    def __init__(self, layers: List[TinyRecursiveReasoningModel_ACTV1Block]):
+class TRMDiffusion_ACTV1ReasoningModule(nn.Module):
+    
+    def __init__(self, layers: List[TRMDiffusion_ACTV1Block]):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
 
@@ -115,8 +125,9 @@ class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
         return hidden_states
 
 
-class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
-    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+class TRMDiffusion_ACTV1_Inner(nn.Module):
+    
+    def __init__(self, config: TRMDiffusion_ACTV1Config) -> None:
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
@@ -147,7 +158,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             pass
 
         # Reasoning Layers
-        self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+        self.L_level = TRMDiffusion_ACTV1ReasoningModule(layers=[TRMDiffusion_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -158,6 +169,13 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
+        
+        if self.config.diffusion == "masked":    
+            num_canvas_tokens = self.config.vocab_size + 1 #masked
+        else:
+            num_canvas_tokens = self.config.vocab_size #usd
+            
+        self.embed_canvas = CastedEmbedding(num_canvas_tokens, self.config.hidden_size, init_std=1.0 / self.embed_scale, cast_to=self.forward_dtype)
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -182,24 +200,29 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
-        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+        return TRMDiffusion_ACTV1InnerCarry(
             z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
             z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
         )
         
-    def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
-        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+    def reset_carry(self, reset_flag: torch.Tensor, carry: TRMDiffusion_ACTV1InnerCarry):
+        return TRMDiffusion_ACTV1InnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: TRMDiffusion_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], canvas: torch.Tensor, canvas_probs: torch.Tensor) -> Tuple[TRMDiffusion_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
+        
+        # Canvas
+        canvas_weight = self.embed_canvas.embedding_weight.to(self.forward_dtype)
+        canvas_embeddings = self.embed_canvas(canvas) + canvas_probs.to(self.forward_dtype) @ canvas_weight[:self.config.vocab_size]
+        canvas_embeddings = F.pad(canvas_embeddings, (0, 0, self.puzzle_emb_len, 0))
 
         # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"]) + self.embed_scale * canvas_embeddings
 
         # Forward iterations
         it = 0
@@ -216,37 +239,53 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         z_H = self.L_level(z_H, z_L, **seq_info)
 
         # LM Outputs
-        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        new_carry = TRMDiffusion_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
-class TinyRecursiveReasoningModel_ACTV1(nn.Module):
+class TRMDiffusion_ACTV1(nn.Module):
     """ACT wrapper."""
 
     def __init__(self, config_dict: dict):
         super().__init__()
-        self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)
-        self.inner = TinyRecursiveReasoningModel_ACTV1_Inner(self.config)
+        self.config = TRMDiffusion_ACTV1Config(**config_dict)
+        self.inner = TRMDiffusion_ACTV1_Inner(self.config)
+        self.mask_id = self.config.vocab_size
 
     @property
     def puzzle_emb(self):
         return self.inner.puzzle_emb
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
-        batch_size = batch["inputs"].shape[0]
+        batch_size, seq_len = batch["inputs"].shape[0]
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(
+        return TRMDiffusion_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
             halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
             
+            canvas=torch.empty((batch_size, seq_len), dtype=torch.int32),
+            canvas_probs=torch.empty((batch_size, seq_len, self.config.vocab_size), dtype=torch.float32),
+            
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
         
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+    def initial_canvas(self, labels: torch.Tensor) -> torch.Tensor:
+        if self.config.diffusion == "masked":
+            noise = torch.full_like(labels, self.mask_id)
+        else: noise = torch.randint_like(labels, self.config.vocab_size)
+        
+        if not self.training:
+            return noise
+        
+        noise_level = torch.rand((labels.shape[0], 1), device=labels.device)
+        answer = torch.where(labels == IGNORE_LABEL_ID, 0, labels)
+        return torch.where(torch.rand(labels.shape, device=labels.device) < noise_level, noise, answer)
+        
+    def forward(self, carry: TRMDiffusion_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TRMDiffusion_ACTV1Carry, Dict[str, torch.Tensor]]:
 
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
@@ -255,8 +294,12 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
+        # canvas
+        canvas = torch.where(carry.halted.view(-1, 1), self.initial_canvas(new_current_data["labels"]), carry.canvas)
+        canvas_probs = torch.where(carry.halted.view(-1, 1, 1), 0, carry.canvas_probs)
+        
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data, canvas, canvas_probs)
 
         outputs = {
             "logits": logits,
@@ -265,6 +308,18 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         }
 
         with torch.no_grad():
+            
+            # denoise
+            probs = torch.exp(log_stablemax(logits.to(torch.float32), dim=-1))
+            conf, pred = probs.max(dim=-1)
+            confident = conf >= self.config.confidence_threshold
+            
+            if self.config.diffusion == "masked":
+                new_canvas = torch.where((canvas == self.mask_id) & confident, pred.to(canvas.dtype), canvas)
+                
+            else:
+                new_canvas = torch.where(confident, pred.to(canvas.dtype), torch.randint_like(canvas, self.config.vocab_size))
+            
             # Step
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.config.halt_max_steps
@@ -294,4 +349,4 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        return TRMDiffusion_ACTV1Carry(new_inner_carry, new_steps, halted, new_canvas, probs, new_current_data), outputs

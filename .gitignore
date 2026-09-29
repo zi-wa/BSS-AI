@@ -1,0 +1,7 @@
+trm_env/
+data/
+checkpoints/
+outputs/
+wandb/
+__pycache__/
+requirements_local.txt

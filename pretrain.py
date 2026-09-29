@@ -5,6 +5,7 @@ import math
 import yaml
 import shutil
 import copy
+import json
 
 import torch
 import torch.distributed as dist
@@ -606,14 +607,19 @@ def launch(hydra_config: DictConfig):
         if RANK == 0:
             print("TRAIN")
         train_state.model.train()
+        last_train_metrics = None
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                last_train_metrics = metrics
             if config.ema:
                 ema_helper.update(train_state.model)
+
+        if RANK == 0:
+            print("TRAIN METRICS", json.dumps(last_train_metrics, default=float))
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation
@@ -637,6 +643,7 @@ def launch(hydra_config: DictConfig):
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
+                print("EVAL METRICS", json.dumps(metrics, default=float))
                 
             ############ Checkpointing
             if RANK == 0:
