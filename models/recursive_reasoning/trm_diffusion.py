@@ -259,7 +259,7 @@ class TRMDiffusion_ACTV1(nn.Module):
         return self.inner.puzzle_emb
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
-        batch_size, seq_len = batch["inputs"].shape[0]
+        batch_size, seq_len = batch["inputs"].shape
 
         return TRMDiffusion_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
