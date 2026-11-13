@@ -96,8 +96,14 @@ class ACTLossHead(nn.Module):
             q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
 
             metrics["q_continue_loss"] = q_continue_loss.detach()
+            
+        z_cut_loss = 0
+        if "target_z_cut" in outputs:
+            z_cut_loss = F.binary_cross_entropy_with_logits(outputs["z_cut_logits"] - outputs["z_keep_logits"], outputs["target_z_cut"], reduction="sum")
+            metrics["z_cut_loss"] = z_cut_loss.detach()
+            
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss + z_cut_loss), metrics, detached_outputs, new_carry.halted.all()
 
