@@ -1,3 +1,13 @@
+# Local modifications (vs GitHub HEAD e1e2447), for trm_diffusion_adaptive_v2:
+#   1. z_cut_loss: weighted by outputs["z_cut_valid"] -> samples without a cut/keep decision
+#      (first step of a new puzzle) are excluded from the z loss (gradient already 0 there via detach; fixes the logged value).
+#   2. Metrics: train/z_cut_rate (fraction actually cut) and train/z_label_cut_rate (fraction labeled "cut"),
+#      over decision samples only; multiplied by count because pretrain.py divides non-loss metrics by count.
+#   3. DDP fix (2026-11-16): z_cut_loss starts as 0 * (z_cut_logits - z_keep_logits).sum() whenever the model emits z logits.
+#      With z_label_prob<1 the label is drawn by Python random.random() (unseeded, differs per rank); on ranks without a label
+#      z_head.grad was None, so pretrain.py's `if param.grad is not None: dist.all_reduce(...)` called all_reduce a different
+#      number of times per rank -> hang / mismatched reductions. Now z_head always gets a (zero) grad.
+#   Models without z keys (trm, trm_diffusion, ...) are unaffected.
 from typing import Any, Tuple, Dict, Sequence, Optional
 
 import torch
@@ -98,9 +108,22 @@ class ACTLossHead(nn.Module):
             metrics["q_continue_loss"] = q_continue_loss.detach()
             
         z_cut_loss = 0
+        if "z_cut_logits" in outputs:
+            # DDP: keep z_head grad non-None even on steps without a z label (z_label_prob<1, decided per rank),
+            # otherwise pretrain.py's `if param.grad is not None: all_reduce` desyncs across ranks
+            z_cut_loss = 0 * (outputs["z_cut_logits"] - outputs["z_keep_logits"]).sum()
         if "target_z_cut" in outputs:
-            z_cut_loss = F.binary_cross_entropy_with_logits(outputs["z_cut_logits"] - outputs["z_keep_logits"], outputs["target_z_cut"], reduction="sum")
+            # z_cut_valid (adaptive_v2): only samples that continue the same puzzle have a cut/keep decision
+            w = outputs["z_cut_valid"].to(outputs["z_cut_logits"].dtype) if "z_cut_valid" in outputs else None
+            z_cut_loss = F.binary_cross_entropy_with_logits(outputs["z_cut_logits"] - outputs["z_keep_logits"], outputs["target_z_cut"], weight=w, reduction="sum")
             metrics["z_cut_loss"] = z_cut_loss.detach()
+        if "z_cut_valid" in outputs:
+            with torch.no_grad():
+                v = outputs["z_cut_valid"]; nv = v.sum().clamp_min(1)
+                # pretrain.py divides non-loss metrics by `count` -> multiply by count so the logged value is a rate
+                metrics["z_cut_rate"] = (outputs["z_cut_taken"] & v).sum() / nv * metrics["count"]
+                if "target_z_cut" in outputs:
+                    metrics["z_label_cut_rate"] = ((outputs["target_z_cut"] > 0.5) & v).sum() / nv * metrics["count"]
             
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}

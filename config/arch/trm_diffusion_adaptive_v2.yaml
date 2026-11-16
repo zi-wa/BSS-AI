@@ -1,0 +1,35 @@
+name: recursive_reasoning.trm_diffusion_adaptive_v2@TRMDiffusion_ACTV1
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+H_cycles: 3
+L_cycles: 6
+
+H_layers: 0
+L_layers: 2
+
+hidden_size: 512
+num_heads: 8  # min(2, hidden_size // 64)
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+
+pos_encodings: rope
+forward_dtype: bfloat16
+
+mlp_t: False # use mlp on L instead of transformer
+puzzle_emb_len: 16 # if non-zero, its specified to this value
+no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+
+diffusion: uniform
+confidence_threshold: 0.5
+# z keep/cut head (trm_diffusion_adaptive_v2.py; same values as the code defaults, listed so they can be overridden
+# as plain arch.<key>=... on the command line)
+z_cut_policy: head        # head | random | never
+z_cut_init_bias: -5.0     # cut-logit bias at init (keep bias 0, weights 0) -> starts as "always keep"
+z_label_prob: 1.0         # fraction of training steps with the cut/keep label (1 extra no-grad forward each)
+z_cut_explore_prob: 0.0   # extra random cuts during training
